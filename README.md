@@ -1,33 +1,76 @@
 # News scraper
 
-Two pieces:
+Four pieces:
 
-1. `merge_selectors.py` — folds the split selector files (`site.json` + `site(1).json`) into one file per site.
-2. `news-scraper/` — a Rust CLI that walks each site's feed, paginates, scrapes the articles and reports how well it did.
+1. `scraperBookmark.js` — a bookmarklet that builds a site's selector JSON by clicking elements on the page.
+2. `merge_selectors.py` — folds the split selector files (`site.json` + `site(1).json`) into one file per site.
+3. `news-scraper/` — a Rust CLI that walks each site's feed, paginates, scrapes the articles and reports how well it did.
+4. `override_selectors.py` — folds improved selector files over merged ones; empty fields keep the original.
 
 ## Layout
 
-Put this next to your existing `selectors` folder:
+A typical working directory:
 
 ```
 .
-├── selectors/            <- your 108 raw files
-├── selectors_merged/     <- created by step 1
+├── scraperBookmark.js     <- bookmarklet source, pasted into a browser bookmark
+├── selectors/             <- raw selector files, one or more per site
+├── selectors_merged/      <- created by step 2
 ├── merge_selectors.py
+├── new_selectors/         <- bookmarklet downloads land here (step 1)
+├── new_selectors_merged/  <- created by running step 2 on them
+├── override_selectors.py
 ├── news-scraper/
 │   ├── Cargo.toml
 │   └── src/
-└── output/               <- created by step 2
+└── output/                <- created by step 3
 ```
 
-## 1. Merge
+## 1. Pick selectors with the bookmarklet
+
+`scraperBookmark.js` is a bookmarklet that builds a site's selector JSON by clicking elements on the
+page instead of digging through HTML in devtools.
+
+**Install it once:** create a new bookmark in your browser (name it e.g. `Scraper Setup`) and paste
+the entire contents of `scraperBookmark.js` — the whole `javascript:(function(){...})();` line — into
+the bookmark's URL field.
+
+**Use it per site:**
+
+1. Open the site's feed page and click the bookmark. A "Scraper Setup" panel opens in the top-right
+   with all 13 fields; `website_link` is filled in automatically from the page's origin.
+2. Click a field in the panel to make it active, then click the matching element on the page
+   (hovering outlines elements in blue). The panel records a short CSS path for the click — up to
+   three levels of tag/`#id`/classes — and jumps to the next empty field.
+3. A few fields are typed rather than clicked:
+   - `feed_link` — press **Capture Current** while on the feed page, or click the row and paste a URL.
+   - `pagination_type` — a prompt: `1` Infinite Scroll (`scroll`), `2` Next Button (`next_button`),
+     `3` Page Numbers (`page_numbers`), `4` URL Pattern (`url_pattern`).
+   - `pagination_pattern` (e.g. `https://site.com/news?page={page}`) and `first_page_number` — text prompts.
+4. The article-side fields (`title_selector`, `description_selector`, …) are picked on an article
+   page: switch to **Mode: Navigating**, open any article as a normal visitor, switch back to
+   **Mode: Selecting** and click the title, date, and so on.
+5. **Download JSON** saves `<hostname>.json`; **Close** closes the panel and wipes the saved state.
+
+Progress is kept in `sessionStorage`, so reloads and navigating between pages don't lose your picks —
+but it is per tab, so do the whole site in one tab. If you do the feed side and article side in two
+separate sessions you end up with `host.json` and `host(1).json`, which is exactly the split step 2
+merges.
+
+Put the downloads in a folder and merge them the same way as step 2:
+
+```bash
+python merge_selectors.py -i new_selectors -o new_selectors_merged
+```
+
+## 2. Merge
 
 ```bash
 python merge_selectors.py -i selectors -o selectors_merged
 ```
 
-Files are grouped by the host in `website_link` (not by file name), so `en.irna.ir.json` and
-`en.irna.ir(1).json` land in the same group regardless of the `(N)` convention. Within a group each
+Files are grouped by the host in `website_link` (not by file name), so `example.com.json` and
+`example.com(1).json` land in the same group regardless of the `(N)` convention. Within a group each
 field takes the first non-empty value, base file before `(1)` before `(2)`.
 
 The output keeps the original 14 fields and adds two:
@@ -39,7 +82,7 @@ It prints (and writes to `selectors_merged/_merge_report.json`) which sites were
 several files, where values conflicted, and which sites are unusable because `feed_link` or
 `article_link_selector` is empty. Add `--check` to analyse without writing.
 
-## 2. Scrape
+## 3. Scrape
 
 Needs Rust: <https://rustup.rs>. Then:
 
@@ -66,13 +109,13 @@ news-scraper --max-pages 2 --max-articles 20
 Everything since a date, across more pages:
 
 ```bash
-news-scraper --since 2026-09-01 --max-pages 25
+news-scraper --since 2025-01-01 --max-pages 25
 ```
 
 One site, verbose, one JSON file per article:
 
 ```bash
-news-scraper --site iz.ru --format files -v
+news-scraper --site example.com --format files -v
 ```
 
 ### Options
@@ -104,7 +147,7 @@ news-scraper --site iz.ru --format files -v
 output/
 ├── run_summary.json          machine-readable, every site
 ├── run_summary.md            the readable one - start here
-└── iz.ru/
+└── example.com/
     ├── articles.jsonl        one article per line
     ├── _seen_urls.txt        used by --resume
     └── summary.json          this site's report
@@ -153,8 +196,8 @@ The same numbers are in `run_summary.json`, `summary.json` per site, and the per
 
 ### How articles are found and parsed
 
-`article_link_selector` often points at something that is not the `<a>` — the iz.ru config ends in a
-`<span>`. For each match the scraper looks at the element's own `href`, then an enclosing `<a>`, then
+`article_link_selector` often points at something that is not the `<a>` — a `<span>` inside the link,
+for example. For each match the scraper looks at the element's own `href`, then an enclosing `<a>`, then
 an `<a>` inside it, then the first link in up to three enclosing containers. Links are made absolute,
 de-duplicated, and restricted to the feed's own host.
 
@@ -167,7 +210,7 @@ names, `N hours ago`, and dates embedded in longer strings. Values with no timez
 which is accurate enough for day-level `--since`/`--until` filtering; the raw string is always kept.
 
 Response bodies are decoded using the charset from the `Content-Type` header, then from the
-document's `<meta charset>`, then UTF-8 — several of these sites are windows-1251.
+document's `<meta charset>`, then UTF-8 — some sites serve legacy encodings such as windows-1251.
 
 ### Reading the report
 
@@ -177,6 +220,36 @@ your configured selectors produced a value), then three sections that are the ac
 - **Sites that produced nothing** — with the reason: unreachable, no links matched, no `feed_link`.
 - **Selectors that never matched** — configured in the JSON, matched nothing on any article. These are the ones to re-pick.
 - **Selectors that would not parse as CSS** — typos in the selector string.
+
+Re-pick the failing ones with the bookmarklet (step 1) and fold the fixes in as described in step 4.
+
+## 4. Override selectors with improved ones
+
+The files the bookmarklet produces are complete, but you usually only want to replace the fields that
+were actually wrong. `override_selectors.py` folds the new files over the merged ones:
+
+```bash
+python override_selectors.py \
+    --base selectors_merged \
+    --override new_selectors_merged \
+    --out selectors_final
+```
+
+- Files are matched by name: `example.com.json` in the override folder updates `example.com.json` in the
+  base folder.
+- Only non-empty values override. `""`, `[]`, `{}` and `null` all mean "keep the original", so a
+  bookmarklet file that only fixed `title_selector` touches nothing else. Nested objects like
+  `_meta` are merged recursively with the same rule.
+- Files with no matching base file are skipped (and reported); base files with no override are
+  copied through unchanged, so `--out` is always a complete set you can point the scraper at:
+
+  ```bash
+  news-scraper --config-dir selectors_final
+  ```
+
+Omit `--out` and the base folder is overwritten in place, which keeps the scraper's default
+`--config-dir` working. With no arguments at all it does exactly that: `--base selectors_merged`,
+`--override new_selectors_merged`, merged in place.
 
 ### Notes
 
