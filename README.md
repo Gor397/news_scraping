@@ -16,14 +16,14 @@ A typical working directory:
 .
 ├── scraperBookmark.js      <- bookmarklet source, pasted into a browser bookmark
 ├── selectors/              <- raw selector files, one or more per site
-├── selectors_merged/       <- created by step 2
-├── merge_selectors.py
-├── new_selectors/          <- bookmarklet downloads land here (step 1)
-├── new_selectors_merged/   <- created by running step 2 on them
-├── override_selectors.py
-├── upload_selectors.py
+├── selectors_merged/       <- created by step 2 (merged multiple json files for the same website)
+├── merge_selectors.py      <- script for merging 2 or more json files of the same webste into 1 json file and adding metadata
+├── new_selectors/          <- bookmarklet downloads land here (step 1) (new partially updated css selectors for overriding the old selectors)
+├── new_selectors_merged/   <- created by running step 2 on them (merged new updated selectors)
+├── override_selectors.py   <- override the old json files with the new updated css selectors from new_selectors_merged folder
+├── upload_selectors.py     <- upload css selector json files to postegres db
 ├── Cargo.toml              <- the Rust scraper (step 3)
-├── src/
+├── src/                    <- scraper
 └── output/                 <- created by step 3 (file mode)
 ```
 
