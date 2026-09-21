@@ -4,8 +4,9 @@ Four pieces:
 
 1. `scraperBookmark.js` — a bookmarklet that builds a site's selector JSON by clicking elements on the page.
 2. `merge_selectors.py` — folds the split selector files (`site.json` + `site(1).json`) into one file per site.
-3. `news-scraper/` — a Rust CLI that walks each site's feed, paginates, scrapes the articles and reports how well it did.
+3. `news-scraper` — a Rust CLI that walks each site's feed, paginates, scrapes the articles and reports how well it did. Saves to JSON files or a Postgres database.
 4. `override_selectors.py` — folds improved selector files over merged ones; empty fields keep the original.
+5. `upload_selectors.py` — uploads merged selector files into the Postgres `site_configs` table.
 
 ## Layout
 
@@ -13,17 +14,17 @@ A typical working directory:
 
 ```
 .
-├── scraperBookmark.js     <- bookmarklet source, pasted into a browser bookmark
-├── selectors/             <- raw selector files, one or more per site
-├── selectors_merged/      <- created by step 2
+├── scraperBookmark.js      <- bookmarklet source, pasted into a browser bookmark
+├── selectors/              <- raw selector files, one or more per site
+├── selectors_merged/       <- created by step 2
 ├── merge_selectors.py
-├── new_selectors/         <- bookmarklet downloads land here (step 1)
-├── new_selectors_merged/  <- created by running step 2 on them
+├── new_selectors/          <- bookmarklet downloads land here (step 1)
+├── new_selectors_merged/   <- created by running step 2 on them
 ├── override_selectors.py
-├── news-scraper/
-│   ├── Cargo.toml
-│   └── src/
-└── output/                <- created by step 3
+├── upload_selectors.py
+├── Cargo.toml              <- the Rust scraper (step 3)
+├── src/
+└── output/                 <- created by step 3 (file mode)
 ```
 
 ## 1. Pick selectors with the bookmarklet
@@ -87,12 +88,11 @@ several files, where values conflicted, and which sites are unusable because `fe
 Needs Rust: <https://rustup.rs>. Then:
 
 ```bash
-cd news-scraper
 cargo build --release
 ```
 
-The binary lands at `news-scraper/target/release/news-scraper` (`.exe` on Windows). Run it from the
-folder that holds `selectors_merged`.
+The binary lands at `target/release/news-scraper` (`.exe` on Windows). Run it from the folder that
+holds `selectors_merged`.
 
 Sanity check first — prints the plan for every site and exits without a single request:
 
@@ -122,8 +122,10 @@ news-scraper --site example.com --format files -v
 
 | flag | meaning |
 |---|---|
-| `--config-dir <dir>` | merged selector files (default `selectors_merged`) |
+| `--config-dir <dir>` | merged selector files (default `selectors_merged`); optional with `--db` |
 | `--out <dir>` | output root (default `output`) |
+| `--db <url>` | Postgres connection URL: read configs from the DB and save articles there instead of to files |
+| `--db-init` | create the DB tables, then exit; combine with `--db` |
 | `--site <text>` | only sites whose name or URL contains this; repeatable |
 | `--max-pages <n>` | feed pages per feed (default 3) |
 | `--max-articles <n>` | stop a site after this many saved articles |
@@ -143,6 +145,8 @@ news-scraper --site example.com --format files -v
 
 ### Output
 
+By default articles land in the `output/` tree:
+
 ```
 output/
 ├── run_summary.json          machine-readable, every site
@@ -152,6 +156,49 @@ output/
     ├── _seen_urls.txt        used by --resume
     └── summary.json          this site's report
 ```
+
+With `--db` the articles go to Postgres instead (see below); the two `run_summary` files are still
+written under `--out`.
+
+### Postgres instead of files
+
+Pass `--db` with a connection URL and the scraper changes both ends: site configs are read from the
+`site_configs` table and every scraped article is stored in the database instead of the `output/`
+tree. `--format`, `--out` (for articles) and `--resume`'s `_seen_urls.txt` play no role in this mode.
+
+One-time setup:
+
+```bash
+# create the tables
+news-scraper --db "postgresql://user:pass@localhost:5432/news" --db-init
+
+# upload the merged selector files
+python upload_selectors.py -i selectors_merged -d "postgresql://user:pass@localhost:5432/news"
+```
+
+Then run without any JSON folder:
+
+```bash
+news-scraper --db "postgresql://user:pass@localhost:5432/news"
+```
+
+`upload_selectors.py` upserts one row per file (`<name>.json` -> host `name`, the file's content as
+JSONB), so re-uploading an improved file updates that site only; add `--replace` to wipe the table
+first. It needs `pip install psycopg2-binary` and takes `-d` or the `DATABASE_URL` env var.
+
+`--db` and `--config-dir` can be combined: configs are then read from the table *and* the folder
+(the scraper de-duplicates nothing, so a host present in both is scraped twice - pick one source).
+
+Tables the scraper uses:
+
+| table | contents |
+|---|---|
+| `site_configs` | one JSONB config per host, as uploaded by `upload_selectors.py` |
+| `articles` | one row per article: title, author, description, dates, `field_sources`, ...; unique on `(site, url)` |
+| `article_images` / `article_links` | the images, comments (`kind = 'comment'`) and internal links (`kind = 'internal'`) per article |
+| `seen_urls` | what has already been saved, per site - the DB equivalent of `--resume`, always on |
+
+Re-running with the same `--db` skips URLs already in `seen_urls`, like `--resume` does for files.
 
 Each article carries `title`, `description`, `author`, `publish_date` (normalised to RFC 3339),
 `publish_date_raw` (exactly what was on the page), `images`, `comments`, `internal_links`,
@@ -255,4 +302,5 @@ Omit `--out` and the base folder is overwritten in place, which keeps the scrape
 
 - `robots.txt` is not consulted. `--delay-ms` and `--site-concurrency` are the politeness controls; keep them conservative on shared hosting.
 - Requires a reasonably recent Rust (let-else syntax, so 1.65+).
-- `cargo test` covers date parsing, pattern rendering and link/fallback extraction.
+- `cargo test` covers date parsing, pattern rendering, link/fallback extraction and the DB host sanitising.
+- Postgres connections use TLS when the server offers it; the URL goes in `--db` (or `DATABASE_URL` for `upload_selectors.py`) and is not written into the summary files.

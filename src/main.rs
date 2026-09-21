@@ -1,5 +1,6 @@
 mod config;
 mod dates;
+mod db;
 mod extract;
 mod http;
 mod output;
@@ -18,6 +19,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::SiteConfig;
+use db::Db;
 use extract::ArticleSelectors;
 use output::{Article, Format, SiteWriter};
 use pagination::Strategy;
@@ -42,11 +44,12 @@ impl From<OutFormat> for Format {
     }
 }
 
-/// Scrape news sites described by merged selector JSON files.
+/// Scrape news sites described by merged selector JSON files or a Postgres DB.
 #[derive(Debug, Parser)]
 #[command(name = "news-scraper")]
 struct Cli {
     /// Folder of merged selector files (output of merge_selectors.py).
+    /// Optional when --db is given.
     #[arg(long, default_value = "selectors_merged")]
     config_dir: PathBuf,
 
@@ -125,6 +128,15 @@ struct Cli {
     /// -v for debug, -vv for trace.
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
+
+    /// Postgres connection URL; loads site configs from the DB and saves
+    /// articles there instead of writing files under --out.
+    #[arg(long)]
+    db: Option<String>,
+
+    /// Create the DB tables, then exit. Combine with --db.
+    #[arg(long)]
+    db_init: bool,
 }
 
 #[tokio::main]
@@ -132,7 +144,37 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
-    let mut configs = config::load_dir(&cli.config_dir)?;
+    if cli.db_init && cli.db.is_none() {
+        return Err(anyhow!("--db-init needs --db <connection url>"));
+    }
+    if let Some(url) = &cli.db {
+        let db = Db::connect(url).await?;
+        db.ensure_schema().await?;
+        if cli.db_init {
+            info!("database schema is in place");
+            return Ok(());
+        }
+    }
+
+    let mut configs = if let Some(url) = &cli.db {
+        let db = Db::connect(url).await?;
+        let mut from_db = db.load_configs().await?;
+        let n_db = from_db.len();
+        if cli.config_dir.exists() {
+            let from_files = config::load_dir(&cli.config_dir)?;
+            from_db.extend(from_files);
+        }
+        if n_db > 0 {
+            info!(
+                "loaded {} site config(s) from postgres (+{} from files)",
+                n_db,
+                from_db.len() - n_db
+            );
+        }
+        from_db
+    } else {
+        config::load_dir(&cli.config_dir)?
+    };
     let loaded = configs.len();
     if !cli.sites.is_empty() {
         let needles: Vec<String> = cli.sites.iter().map(|s| s.to_lowercase()).collect();
@@ -202,12 +244,19 @@ async fn main() -> Result<()> {
     let site_conc = cli.site_concurrency.max(1);
     let cli = Arc::new(cli);
 
+    // One shared connection for the whole run when saving to Postgres.
+    let db = match &cli.db {
+        Some(url) => Some(Arc::new(Db::connect(url).await?)),
+        None => None,
+    };
+
     let reports: Vec<SiteReport> = stream::iter(configs)
         .map(|cfg| {
             let client = client.clone();
             let cli = Arc::clone(&cli);
+            let db = db.clone();
             async move {
-                match scrape_site(&client, &cli, &cfg, since, until).await {
+                match scrape_site(&client, &cli, &cfg, since, until, db.as_deref()).await {
                     Ok(report) => report,
                     Err(e) => {
                         warn!(site = %cfg.name, "site aborted: {e}");
@@ -282,12 +331,35 @@ async fn finish_feed_fetch(
     }
 }
 
+/// Where saved articles go: the `output/` tree or a Postgres database.
+enum ArticleSink {
+    Files(SiteWriter),
+    Db(Db),
+}
+
+impl ArticleSink {
+    async fn write(&mut self, article: &Article) -> Result<()> {
+        match self {
+            ArticleSink::Files(w) => w.write(article),
+            ArticleSink::Db(db) => db.save_article(article).await,
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        match self {
+            ArticleSink::Files(w) => w.finish(),
+            ArticleSink::Db(_) => Ok(()),
+        }
+    }
+}
+
 async fn scrape_site(
     client: &reqwest::Client,
     cli: &Cli,
     cfg: &SiteConfig,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
+    db: Option<&Db>,
 ) -> Result<SiteReport> {
     let clock = Instant::now();
     let started = Utc::now();
@@ -316,8 +388,16 @@ async fn scrape_site(
 
     let sels = ArticleSelectors::from(cfg);
     let site_name = rep.site.clone();
-    let (mut writer, mut seen) =
-        SiteWriter::new(&cli.out, &rep.site, cli.format.into(), cli.resume)?;
+    let (mut sink, mut seen) = match db {
+        Some(db) => {
+            let seen = db.seen_urls(&rep.site).await?;
+            (ArticleSink::Db(db.clone()), seen)
+        }
+        None => {
+            let (w, seen) = SiteWriter::new(&cli.out, &rep.site, cli.format.into(), cli.resume)?;
+            (ArticleSink::Files(w), seen)
+        }
+    };
     if !seen.is_empty() {
         info!(site = %rep.site, "resuming, {} URL(s) already saved", seen.len());
     }
@@ -530,7 +610,7 @@ async fn scrape_site(
                         rep.articles_saved_with_date += 1;
                     }
                     rep.internal_links_total += article.internal_links.len();
-                    writer.write(&article)?;
+                    sink.write(&article).await?;
                     rep.articles_saved += 1;
                 }
 
@@ -565,8 +645,11 @@ async fn scrape_site(
         }
     }
 
-    let dir = writer.dir().to_path_buf();
-    writer.finish()?;
+    let out_label = match &sink {
+        ArticleSink::Files(w) => w.dir().display().to_string(),
+        ArticleSink::Db(_) => "postgres".to_string(),
+    };
+    sink.finish()?;
     finish(&mut rep, started, clock);
 
     info!(
@@ -574,7 +657,7 @@ async fn scrape_site(
         "done: {} | health {:.0} -> {}",
         rep.stats_line(),
         rep.health,
-        dir.display()
+        out_label
     );
     Ok(rep)
 }
@@ -702,6 +785,8 @@ fn options_map(cli: &Cli) -> BTreeMap<String, String> {
     m.insert("retries".into(), cli.retries.to_string());
     m.insert("resume".into(), cli.resume.to_string());
     m.insert("dry_run".into(), cli.dry_run.to_string());
+    // Deliberately not the URL itself: it usually contains the password.
+    m.insert("storage".into(), if cli.db.is_some() { "postgres" } else { "files" }.into());
     m
 }
 

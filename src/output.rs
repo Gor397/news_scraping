@@ -136,7 +136,7 @@ impl SiteWriter {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<()> {
+    pub fn finish(&mut self) -> Result<()> {
         if let Some(w) = self.jsonl.as_mut() {
             w.flush()?;
         }
