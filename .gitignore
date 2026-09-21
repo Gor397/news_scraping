@@ -1,0 +1,11 @@
+news-scraper/target/
+output/
+selectors_merged/
+selectors/
+new_selectors/
+new_merged_selectors/
+merged_output/
+target/
+.freebuff/
+__pycache__/
+*.pyc
