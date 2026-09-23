@@ -9,6 +9,7 @@
 use crate::config::SiteConfig;
 use crate::output::Article;
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
@@ -92,8 +93,23 @@ impl Db {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let host: String = row.get(0);
-            let raw: serde_json::Value =
-                serde_json::from_slice(row.try_get::<_, &[u8]>(1)?).with_context(|| format!("bad JSON for '{host}'"))?;
+            // The column is JSONB and `with-serde_json-1` gives `serde_json::Value`
+            // a direct JSONB impl, but a binary built without that feature (or a
+            // cast-to-TEXT row shape left over from older builds) yields text or
+            // raw JSON bytes instead. Accept every shape so stale binaries and
+            // legacy schemas both keep working.
+            let raw: serde_json::Value = if row.try_get::<_, serde_json::Value>(1).is_ok() {
+                row.get(1)
+            } else if let Ok(text) = row.try_get::<_, String>(1) {
+                serde_json::from_str(&text)
+                    .with_context(|| format!("bad JSON text for '{host}'"))?
+            } else {
+                let bytes: Vec<u8> = row
+                    .try_get(1)
+                    .with_context(|| format!("bad config JSON for '{host}'"))?;
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("bad config JSON bytes for '{host}'"))?
+            };
             let cfg: SiteConfig = serde_json::from_value(raw)
                 .with_context(|| format!("bad config row for '{host}'"))?;
             out.push(SiteConfig {
@@ -121,6 +137,18 @@ impl Db {
     /// NOTHING), so an interrupted run is healed by the next one; no explicit
     /// transaction is held because `Client::transaction` needs `&mut`.
     pub async fn save_article(&self, a: &Article) -> Result<()> {
+        // TIMESTAMPTZ columns want real timestamps, not text. `fetched_at` is
+        // always RFC 3339 (`Utc::now().to_rfc3339()`); `publish_date` is RFC
+        // 3339 when it could be parsed, otherwise NULL.
+        let fetched_at = DateTime::parse_from_rfc3339(&a.fetched_at)
+            .with_context(|| format!("bad fetched_at '{}' for {}", a.fetched_at, a.url))?
+            .with_timezone(&Utc);
+        let publish_date = a
+            .publish_date
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
         let row = self
             .client
             .query_one(
@@ -146,14 +174,14 @@ impl Db {
                     &a.url,
                     &a.source_page,
                     &(a.http_status as i32),
-                    &a.fetched_at,
+                    &fetched_at,
                     &a.title,
                     &a.author,
-                    &a.publish_date,
+                    &publish_date,
                     &a.publish_date_raw,
                     &a.description,
                     &(a.word_count as i32),
-                    &serde_json::to_vec(&a.field_sources)?,
+                    &serde_json::to_value(&a.field_sources)?,
                 ],
             )
             .await
@@ -284,11 +312,71 @@ fn sanitize_host(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Article;
+    use std::collections::BTreeMap;
+    use tokio_postgres::types::{FromSql, ToSql, Type};
 
     #[test]
     fn sanitizes_hosts_like_output() {
         assert_eq!(sanitize_host("en.example.com"), "en.example.com");
         assert_eq!(sanitize_host("bad host"), "bad_host");
         assert_eq!(sanitize_host("..."), "site");
+    }
+
+    #[test]
+    fn jsonb_and_timestamptz_impls_are_enabled() {
+        // `serde_json::Value: FromSql` needs tokio-postgres' `with-serde_json-1`
+        // and `DateTime<Utc>` needs `with-chrono-0_4`; without those features
+        // these impls do not exist and this test fails to compile.
+        assert!(<serde_json::Value as FromSql>::accepts(&Type::JSONB));
+        assert!(<DateTime<Utc> as FromSql>::accepts(&Type::TIMESTAMPTZ));
+    }
+
+    /// Compiles the `save_article` parameter list against the real `ToSql`
+    /// impls, catching at build time the "cannot convert between the Rust type
+    /// `&[u8]` and the Postgres type `jsonb`" class of errors.
+    #[test]
+    fn save_article_params_use_typed_jsonb_and_timestamps() {
+        let article = Article {
+            site: "example.com".into(),
+            url: "https://example.com/a".into(),
+            source_page: "https://example.com/feed".into(),
+            http_status: 200,
+            fetched_at: "2026-09-23T10:05:59.011+00:00".into(),
+            title: Some("t".into()),
+            author: None,
+            publish_date: Some("2026-09-01T08:30:00+00:00".into()),
+            publish_date_raw: Some("1 Sep 2026".into()),
+            description: None,
+            word_count: 12,
+            images: vec![],
+            comments: vec![],
+            internal_links: vec![],
+            field_sources: BTreeMap::from([("title".into(), "selector".into())]),
+            publish_dt: None,
+        };
+        let fetched_at = DateTime::parse_from_rfc3339(&article.fetched_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        let publish_date = article
+            .publish_date
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let _params: [&dyn ToSql; 12] = [
+            &article.site,
+            &article.url,
+            &article.source_page,
+            &(article.http_status as i32),
+            &fetched_at,
+            &article.title,
+            &article.author,
+            &publish_date,
+            &article.publish_date_raw,
+            &article.description,
+            &(article.word_count as i32),
+            &serde_json::to_value(&article.field_sources).unwrap(),
+        ];
     }
 }

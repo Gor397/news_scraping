@@ -8,6 +8,31 @@ Four pieces:
 4. `override_selectors.py` — folds improved selector files over merged ones; empty fields keep the original.
 5. `upload_selectors.py` — uploads merged selector files into the Postgres `site_configs` table.
 
+## Running inside the Django project
+
+The scraper is integrated into the Django backend via `scrape_rust`, which runs
+the binary in `--db` mode against the project's Postgres and then imports the
+scraped rows from the `articles` table into the Django `Post` table (through
+`PostService.save_many`, so journalists, images, links and the alerting
+pipeline all behave exactly like the other scrapers).
+
+```bash
+make scrape_rust                                    # full run: scrape + import
+make scrape_rust ARGS="--site example.com --max-pages 5"
+make scrape_rust ARGS="--list-sites"                # dry plan, no requests
+make scrape_rust ARGS="--sync-selectors-only"       # just upload selectors_merged
+make scrape_rust ARGS="--import-only"               # import pending rows only
+make scrape_rust ARGS="--no-import"                 # scrape, leave Post alone
+make scrape_rust ARGS="--reset-cursor --import-only"  # re-import everything
+```
+
+Implementation: `news_classification/services/rust_scraper_import.py` and
+`news_classification/management/commands/scrape_rust.py`. Import is
+incremental — a cursor (`last_article_id`) stored on the run's `ScrapingRun`
+row keeps track of what has already been imported, so re-running only pulls
+new articles. Sites that have no matching `NewsWebsite` row are imported with
+a NULL website reference.
+
 ## Layout
 
 A typical working directory:

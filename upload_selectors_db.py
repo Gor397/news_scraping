@@ -46,13 +46,25 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("-i", "--input", default="selectors_merged", type=Path,
-                    help="folder with merged selector files (default: selectors_merged)")
-    ap.add_argument("-d", "--database", default=None,
-                    help="postgres URL, e.g. postgresql://user:pass@localhost:5432/news "
-                         "(default: DATABASE_URL env var)")
-    ap.add_argument("--replace", action="store_true",
-                    help="delete all existing rows before uploading")
+    ap.add_argument(
+        "-i",
+        "--input",
+        default="selectors_merged",
+        type=Path,
+        help="folder with merged selector files (default: selectors_merged)",
+    )
+    ap.add_argument(
+        "-d",
+        "--database",
+        default=None,
+        help="postgres URL, e.g. postgresql://user:pass@localhost:5432/news "
+        "(default: DATABASE_URL env var)",
+    )
+    ap.add_argument(
+        "--replace",
+        action="store_true",
+        help="delete all existing rows before uploading",
+    )
     args = ap.parse_args()
 
     dsn = args.database
@@ -73,10 +85,7 @@ def main() -> int:
     except ImportError:
         sys.exit("needs psycopg2: pip install 'psycopg2-binary'")
 
-    files = sorted(
-        p for p in in_dir.glob("*.json")
-        if not p.name.startswith("_")
-    )
+    files = sorted(p for p in in_dir.glob("*.json") if not p.name.startswith("_"))
     if not files:
         sys.exit(f"no .json files in {in_dir.resolve()}")
 
